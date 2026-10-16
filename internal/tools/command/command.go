@@ -47,14 +47,15 @@ func New(approver policy.Approver) (*Tool, error) {
 func (Tool) Definition() tools.Definition {
 	return tools.Definition{
 		Name:        "run_command",
-		Description: "Run one host command after the user explicitly approves its exact argv. No shell is added. Output is limited and sent to the model.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":32}},"required":["argv"],"additionalProperties":false}`),
+		Description: "Run one host command after the user explicitly approves its exact argv. Optionally explain its purpose. No shell is added. Output is limited and sent to the model.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":32},"purpose":{"type":"string","description":"Brief single-line explanation for the user; at most 240 Unicode characters"}},"required":["argv"],"additionalProperties":false}`),
 	}
 }
 
 func (t Tool) Run(ctx context.Context, arguments json.RawMessage) (tools.Result, error) {
 	var args struct {
-		Argv []string `json:"argv"`
+		Argv    []string `json:"argv"`
+		Purpose string   `json:"purpose"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(arguments))
 	decoder.DisallowUnknownFields()
@@ -69,10 +70,13 @@ func (t Tool) Run(ctx context.Context, arguments json.RawMessage) (tools.Result,
 	if err := validateArgv(args.Argv); err != nil {
 		return tools.Result{Status: tools.Failed, Code: "invalid_arguments"}, nil
 	}
+	if len([]rune(args.Purpose)) > 240 || strings.IndexFunc(args.Purpose, unicode.IsControl) >= 0 {
+		return tools.Result{Status: tools.Failed, Code: "invalid_arguments"}, nil
+	}
 	if err := ctx.Err(); err != nil {
 		return tools.Result{}, err
 	}
-	approved, err := policy.Approve(ctx, t.approver, policy.CommandRequest{Argv: append([]string(nil), args.Argv...)})
+	approved, err := policy.Approve(ctx, t.approver, policy.CommandRequest{Argv: append([]string(nil), args.Argv...), Purpose: args.Purpose})
 	if err != nil {
 		return tools.Result{}, err
 	}

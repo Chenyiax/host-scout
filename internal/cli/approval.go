@@ -5,15 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strconv"
 	"strings"
 
 	"host-scout/internal/policy"
 )
 
 type terminalApprover struct {
-	input  *inputReader
-	output io.Writer
+	input         *inputReader
+	output        io.Writer
+	managedPrompt bool
 }
 
 func (a terminalApprover) ApproveCommand(ctx context.Context, request policy.CommandRequest) (bool, error) {
@@ -23,12 +23,11 @@ func (a terminalApprover) ApproveCommand(ctx context.Context, request policy.Com
 	if !a.input.terminal {
 		return false, nil
 	}
-	quoted := make([]string, len(request.Argv))
-	for i, arg := range request.Argv {
-		quoted[i] = strconv.Quote(arg)
+	if !a.managedPrompt {
+		printApprovalDetails(a.output, request.Purpose, request.Argv)
 	}
-	fmt.Fprintf(a.output, "\nCommand requested: %s\nIts output will be sent to the model. Allow once? [y/N] ", strings.Join(quoted, " "))
-	line, err := a.input.ReadLine(ctx)
+	fmt.Fprint(a.output, "Allow once? [y/N] ")
+	line, err := a.input.ReadLinePrompt(ctx, "Allow once? [y/N] ", false)
 	if err != nil {
 		if errors.Is(err, errInterrupted) {
 			return false, context.Canceled

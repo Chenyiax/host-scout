@@ -30,19 +30,22 @@ var ErrCleanupFailed = errors.New("command cleanup failed; managed processes may
 
 type Options struct{ Instructions string }
 type Evidence struct {
-	ID         string
-	CallID     string
-	Tool       string
-	CreatedAt  time.Time
-	StartedAt  time.Time
-	FinishedAt time.Time
-	Result     tools.Result
-	Output     string
+	ID                 string
+	CallID             string
+	Tool               string
+	Arguments          json.RawMessage
+	ArgumentsTruncated bool
+	CreatedAt          time.Time
+	StartedAt          time.Time
+	FinishedAt         time.Time
+	Result             tools.Result
+	Output             string
 }
 type EventKind string
 
 const (
 	TurnStarted       EventKind = "turn_started"
+	ModelRequested    EventKind = "model_requested"
 	TextDelta         EventKind = "text_delta"
 	ToolProposed      EventKind = "tool_proposed"
 	ApprovalRequested EventKind = "approval_requested"
@@ -58,6 +61,8 @@ type Event struct {
 	CallID   string
 	Tool     string
 	Argv     []string
+	Purpose  string
+	Step     int
 	Approved bool
 	Evidence *Evidence
 	Err      error
@@ -123,6 +128,7 @@ func (s *Session) Ask(ctx context.Context, question string, hooks Hooks) (err er
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		emit(Event{Kind: ModelRequested, Step: step + 1})
 		streamed := false
 		response, requestErr := s.client.Create(ctx, model.Request{Instructions: s.instructions, Items: s.History(), Tools: s.tools.Definitions()}, func(delta string) {
 			if delta != "" {
@@ -191,7 +197,7 @@ func (s *Session) Ask(ctx context.Context, question string, hooks Hooks) (err er
 				})
 				callCtx = policy.WithObserver(callCtx, policy.Observer{
 					Requested: func(r policy.CommandRequest) {
-						emit(Event{Kind: ApprovalRequested, Tool: call.Name, CallID: call.CallID, Argv: append([]string(nil), r.Argv...)})
+						emit(Event{Kind: ApprovalRequested, Tool: call.Name, CallID: call.CallID, Argv: append([]string(nil), r.Argv...), Purpose: r.Purpose})
 					},
 					Resolved: func(approved bool) {
 						emit(Event{Kind: ApprovalResolved, Tool: call.Name, CallID: call.CallID, Approved: approved})
@@ -314,7 +320,13 @@ func (s *Session) record(call model.ToolCall, result tools.Result, created, star
 		result = tools.Result{Status: tools.Failed, Code: "encode_result"}
 		encoded, _ = json.Marshal(result)
 	}
-	e := Evidence{ID: fmt.Sprintf("evidence-%03d", s.nextID), CallID: call.CallID, Tool: call.Name, CreatedAt: created, StartedAt: started, FinishedAt: time.Now(), Result: tools.CloneResult(result), Output: string(encoded)}
+	const maxDisplayedArguments = 16 << 10
+	arguments := append(json.RawMessage(nil), call.Arguments...)
+	argumentsTruncated := len(arguments) > maxDisplayedArguments
+	if argumentsTruncated {
+		arguments = arguments[:maxDisplayedArguments]
+	}
+	e := Evidence{ID: fmt.Sprintf("evidence-%03d", s.nextID), CallID: call.CallID, Tool: call.Name, Arguments: arguments, ArgumentsTruncated: argumentsTruncated, CreatedAt: created, StartedAt: started, FinishedAt: time.Now(), Result: tools.CloneResult(result), Output: string(encoded)}
 	if len(e.Output) > 32<<10 {
 		e.Output = e.Output[:32<<10] + "\n[record display truncated]"
 	}
@@ -326,7 +338,11 @@ func (s *Session) record(call model.ToolCall, result tools.Result, created, star
 	s.history = append(s.history, model.Item{Kind: model.ToolResultItem, CallID: call.CallID, Text: string(feedback)})
 	return e
 }
-func cloneEvidence(e Evidence) Evidence { e.Result = tools.CloneResult(e.Result); return e }
+func cloneEvidence(e Evidence) Evidence {
+	e.Result = tools.CloneResult(e.Result)
+	e.Arguments = append(json.RawMessage(nil), e.Arguments...)
+	return e
+}
 func (s *Session) Evidence() []Evidence {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -6,7 +6,8 @@ import "context"
 // CommandRequest describes the exact process the agent wants to start.
 // Implementations must require an explicit, per-call decision.
 type CommandRequest struct {
-	Argv []string
+	Argv    []string
+	Purpose string
 }
 
 type Approver interface {
@@ -27,7 +28,7 @@ func WithObserver(ctx context.Context, observer Observer) context.Context {
 func Approve(ctx context.Context, approver Approver, request CommandRequest) (bool, error) {
 	observer, _ := ctx.Value(approvalKey{}).(Observer)
 	if observer.Requested != nil {
-		observer.Requested(CommandRequest{Argv: append([]string(nil), request.Argv...)})
+		observer.Requested(CommandRequest{Argv: append([]string(nil), request.Argv...), Purpose: request.Purpose})
 	}
 	approved, err := approver.ApproveCommand(ctx, request)
 	if err == nil && ctx.Err() != nil {

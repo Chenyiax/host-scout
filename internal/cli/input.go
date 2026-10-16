@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
+	"github.com/rivo/uniseg"
 	"golang.org/x/term"
 	"io"
 	"os"
@@ -17,7 +19,11 @@ type lineReply struct {
 	line string
 	err  error
 }
-type lineRequest struct{ reply chan lineReply }
+type lineRequest struct {
+	reply   chan lineReply
+	prompt  string
+	history bool
+}
 
 // inputReader owns exactly one input consumer for its lifetime. Pipes scan on
 // demand, preserving queued lines. Raw terminals consume continuously, discard
@@ -35,6 +41,13 @@ type inputReader struct {
 	mu        sync.Mutex
 	active    *lineRequest
 	buffer    []byte
+	cursor    int
+	escape    []byte
+	utf8Buf   []byte
+	editing   bool
+	history   []string
+	historyAt int
+	draft     string
 	eof       bool
 	pipeErr   error
 	onStop    func()
@@ -83,16 +96,22 @@ func (in *inputReader) stop(eof bool) {
 		in.active = nil
 	}
 	in.buffer = nil
+	in.cursor = 0
+	in.escape = nil
+	in.utf8Buf = nil
 	in.mu.Unlock()
 	if in.onStop != nil {
 		in.onStop()
 	}
 }
 func (in *inputReader) ReadLine(ctx context.Context) (string, error) {
+	return in.ReadLinePrompt(ctx, "", false)
+}
+func (in *inputReader) ReadLinePrompt(ctx context.Context, prompt string, history bool) (string, error) {
 	if ctx.Err() != nil {
 		return "", ctx.Err()
 	}
-	req := &lineRequest{reply: make(chan lineReply, 1)}
+	req := &lineRequest{reply: make(chan lineReply, 1), prompt: prompt, history: history}
 	if in.terminal {
 		in.mu.Lock()
 		if in.eof {
@@ -101,6 +120,11 @@ func (in *inputReader) ReadLine(ctx context.Context) (string, error) {
 		}
 		in.active = req
 		in.buffer = nil
+		in.cursor = 0
+		in.escape = nil
+		in.utf8Buf = nil
+		in.historyAt = len(in.history)
+		in.draft = ""
 		in.mu.Unlock()
 	} else {
 		select {
@@ -129,12 +153,181 @@ func (in *inputReader) ReadLine(ctx context.Context) (string, error) {
 		if in.active == req {
 			in.active = nil
 			in.buffer = nil
+			in.cursor = 0
 		}
 		in.mu.Unlock()
 		return "", ctx.Err()
 	case <-in.ctx.Done():
 		return "", io.EOF
 	}
+}
+
+func (in *inputReader) Remember(line string) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if line == "" || len(line) > 4096 {
+		return
+	}
+	if len(in.history) == 0 || in.history[len(in.history)-1] != line {
+		in.history = append(in.history, line)
+	}
+	total := 0
+	for _, item := range in.history {
+		total += len(item)
+	}
+	for len(in.history) > 100 || total > 64<<10 {
+		total -= len(in.history[0])
+		in.history = in.history[1:]
+	}
+}
+func (in *inputReader) ClearHistory() {
+	in.mu.Lock()
+	in.history = nil
+	in.historyAt = 0
+	in.draft = ""
+	in.mu.Unlock()
+}
+
+func previousCluster(value []byte, cursor int) int {
+	start := 0
+	for start < cursor {
+		_, rest, _, _ := uniseg.FirstGraphemeCluster(value[start:cursor], -1)
+		next := cursor - len(rest)
+		if next >= cursor {
+			return start
+		}
+		start = next
+	}
+	return 0
+}
+func nextCluster(value []byte, cursor int) int {
+	if cursor >= len(value) {
+		return len(value)
+	}
+	cluster, _, _, _ := uniseg.FirstGraphemeCluster(value[cursor:], -1)
+	return cursor + len(cluster)
+}
+func (in *inputReader) redraw(req *lineRequest) {
+	if !in.editing {
+		return
+	}
+	value := string(in.buffer)
+	_, _ = fmt.Fprintf(in.out, "\r\x1b[2K%s%s", req.prompt, value)
+	if cells := uniseg.StringWidth(string(in.buffer[in.cursor:])); cells > 0 {
+		_, _ = fmt.Fprintf(in.out, "\x1b[%dD", cells)
+	}
+}
+func (in *inputReader) historyMove(req *lineRequest, delta int) {
+	if !req.history || len(in.history) == 0 {
+		return
+	}
+	if delta < 0 {
+		if in.historyAt == 0 {
+			return
+		}
+		if in.historyAt == len(in.history) {
+			in.draft = string(in.buffer)
+		}
+		in.historyAt--
+		in.buffer = []byte(in.history[in.historyAt])
+	} else {
+		if in.historyAt >= len(in.history) {
+			return
+		}
+		in.historyAt++
+		if in.historyAt == len(in.history) {
+			in.buffer = []byte(in.draft)
+		} else {
+			in.buffer = []byte(in.history[in.historyAt])
+		}
+	}
+	in.cursor = len(in.buffer)
+	in.redraw(req)
+}
+func (in *inputReader) editByte(req *lineRequest, b byte) {
+	if len(in.escape) > 0 || b == 27 {
+		in.escape = append(in.escape, b)
+		if len(in.escape) == 1 {
+			return
+		}
+		if len(in.escape) > 12 {
+			in.escape = nil
+			return
+		}
+		if in.escape[1] != '[' && in.escape[1] != 'O' {
+			in.escape = nil
+			return
+		}
+		if len(in.escape) == 2 {
+			return
+		}
+		if b < 0x40 || b > 0x7e {
+			return
+		}
+		seq := string(in.escape)
+		in.escape = nil
+		switch seq {
+		case "\x1b[D":
+			in.cursor = previousCluster(in.buffer, in.cursor)
+		case "\x1b[C":
+			in.cursor = nextCluster(in.buffer, in.cursor)
+		case "\x1b[H", "\x1bOH", "\x1b[1~", "\x1b[7~":
+			in.cursor = 0
+		case "\x1b[F", "\x1bOF", "\x1b[4~", "\x1b[8~":
+			in.cursor = len(in.buffer)
+		case "\x1b[3~":
+			end := nextCluster(in.buffer, in.cursor)
+			in.buffer = append(in.buffer[:in.cursor], in.buffer[end:]...)
+		case "\x1b[A":
+			in.historyMove(req, -1)
+			return
+		case "\x1b[B":
+			in.historyMove(req, 1)
+			return
+		}
+		in.redraw(req)
+		return
+	}
+	if b == 8 || b == 127 {
+		start := previousCluster(in.buffer, in.cursor)
+		if start < in.cursor {
+			in.buffer = append(in.buffer[:start], in.buffer[in.cursor:]...)
+			in.cursor = start
+			in.redraw(req)
+		}
+		return
+	}
+	if b < 32 && b != '\t' {
+		return
+	}
+	in.utf8Buf = append(in.utf8Buf, b)
+	if !utf8.FullRune(in.utf8Buf) {
+		return
+	}
+	if !utf8.Valid(in.utf8Buf) {
+		in.utf8Buf = nil
+		return
+	}
+	if len(in.buffer)+len(in.utf8Buf) > 1<<20 {
+		req.reply <- lineReply{err: errors.New("input exceeds 1 MiB")}
+		in.active = nil
+		in.buffer = nil
+		in.utf8Buf = nil
+		return
+	}
+	appendAtEnd := in.cursor == len(in.buffer)
+	updated := make([]byte, 0, len(in.buffer)+len(in.utf8Buf))
+	updated = append(updated, in.buffer[:in.cursor]...)
+	updated = append(updated, in.utf8Buf...)
+	updated = append(updated, in.buffer[in.cursor:]...)
+	in.buffer = updated
+	in.cursor += len(in.utf8Buf)
+	if appendAtEnd && in.editing {
+		_, _ = in.out.Write(in.utf8Buf)
+	} else {
+		in.redraw(req)
+	}
+	in.utf8Buf = nil
 }
 func (in *inputReader) pipeLoop() {
 	defer close(in.done)
@@ -190,23 +383,8 @@ func (in *inputReader) terminalLoop() {
 					req.reply <- lineReply{line: string(in.buffer)}
 					in.active = nil
 					in.buffer = nil
-				case 8, 127:
-					if len(in.buffer) > 0 {
-						_, size := utf8.DecodeLastRune(in.buffer)
-						in.buffer = in.buffer[:len(in.buffer)-size]
-						_, _ = io.WriteString(in.out, "\b \b")
-					}
 				default:
-					if b >= 32 || b == '\t' {
-						if len(in.buffer) >= 1<<20 {
-							req.reply <- lineReply{err: errors.New("input exceeds 1 MiB")}
-							in.active = nil
-							in.buffer = nil
-						} else {
-							in.buffer = append(in.buffer, b)
-							_, _ = in.out.Write([]byte{b})
-						}
-					}
+					in.editByte(req, b)
 				}
 			}
 			in.mu.Unlock()

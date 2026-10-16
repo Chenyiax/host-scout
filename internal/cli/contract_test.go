@@ -88,7 +88,7 @@ func TestCLIEndToEndHistoryDenialFailureAndClear(t *testing.T) {
 			t.Fatalf("missing/duplicate %s: %s", text, &out)
 		}
 	}
-	if len(requests) != 6 || !strings.Contains(out.String(), "No host observation") || !strings.Contains(out.String(), "call=denied1") || !strings.Contains(errs.String(), "remote_failed") || strings.Contains(errs.String(), "test-key") {
+	if len(requests) != 6 || !strings.Contains(out.String(), "No host observation") || !strings.Contains(out.String(), "call=denied1") || !strings.Contains(errs.String(), "remote_failed") || strings.Contains(errs.String(), "test-key") || strings.ContainsRune(out.String(), '\x1b') {
 		t.Fatalf("requests=%d\nout=%s\nerr=%s", len(requests), &out, &errs)
 	}
 	if !strings.Contains(out.String(), "Unknown command") || !strings.Contains(out.String(), "Evidence ID not found") {

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"host-scout/internal/policy"
@@ -10,6 +11,24 @@ import (
 	"testing"
 	"time"
 )
+
+func TestApprovalPromptMatchesDocumentedPurposeAndExactCommand(t *testing.T) {
+	c := controlledTerminal(t, nil)
+	var output bytes.Buffer
+	decisions := make(chan bool, 1)
+	go func() {
+		allow, err := (terminalApprover{input: c.in, output: &output}).ApproveCommand(context.Background(), policy.CommandRequest{Argv: []string{"go", "version"}, Purpose: "检查 Go 版本"})
+		if err != nil {
+			t.Error(err)
+		}
+		decisions <- allow
+	}()
+	awaitActive(t, c.in)
+	c.send("n\n")
+	if <-decisions || !strings.Contains(output.String(), "Model purpose: 检查 Go 版本\nCommand requested: \"go\" \"version\"\nIts output will be sent to the model.\nAllow once? [y/N]") {
+		t.Fatalf("unexpected approval: %s", output.String())
+	}
+}
 
 type controlledInput struct {
 	in        *inputReader
@@ -82,7 +101,7 @@ func TestTerminalCancelAndStaleApproval(t *testing.T) {
 	c.send("\n")
 	decisions := make(chan bool, 1)
 	go func() {
-		allow, err := (terminalApprover{c.in, io.Discard}).ApproveCommand(context.Background(), policy.CommandRequest{Argv: []string{"exact"}})
+		allow, err := (terminalApprover{input: c.in, output: io.Discard}).ApproveCommand(context.Background(), policy.CommandRequest{Argv: []string{"exact"}})
 		if err != nil {
 			t.Error(err)
 		}
@@ -95,7 +114,7 @@ func TestTerminalCancelAndStaleApproval(t *testing.T) {
 	}
 	for _, text := range []string{"Y\n", " yes\n", "message\n"} {
 		go func() {
-			allow, _ := (terminalApprover{c.in, io.Discard}).ApproveCommand(context.Background(), policy.CommandRequest{})
+			allow, _ := (terminalApprover{input: c.in, output: io.Discard}).ApproveCommand(context.Background(), policy.CommandRequest{})
 			decisions <- allow
 		}()
 		awaitActive(t, c.in)
@@ -169,11 +188,57 @@ func TestPipeInputPreservesLinesAndHasOneConsumer(t *testing.T) {
 func TestNonTerminalAuthorizationDoesNotConsumeChat(t *testing.T) {
 	in, _ := newInput(strings.NewReader("followup\n"), io.Discard, nil)
 	defer in.Close()
-	allow, err := (terminalApprover{in, io.Discard}).ApproveCommand(context.Background(), policy.CommandRequest{Argv: []string{"echo"}})
+	allow, err := (terminalApprover{input: in, output: io.Discard}).ApproveCommand(context.Background(), policy.CommandRequest{Argv: []string{"echo"}})
 	if err != nil || allow {
 		t.Fatal("nonterminal granted permission")
 	}
 	if line, err := in.ReadLine(context.Background()); err != nil || line != "followup" {
 		t.Fatal("approval consumed chat")
+	}
+}
+
+func TestTerminalUnicodeEditingAndCursor(t *testing.T) {
+	c := controlledTerminal(t, nil)
+	var out bytes.Buffer
+	c.in.out = &out
+	c.in.editing = true
+	result := make(chan string, 1)
+	go func() { line, _ := c.in.ReadLinePrompt(context.Background(), "scout> ", true); result <- line }()
+	awaitActive(t, c.in)
+	c.send("ab中e\u0301\x1b[D\x1b[DX\x1b[H\x1b[3~\x1b[F\x7f\n")
+	if got := <-result; got != "bX中" {
+		t.Fatalf("edited line %q", got)
+	}
+	if !strings.Contains(out.String(), "\x1b[3D") || !strings.Contains(out.String(), "bX中") {
+		t.Fatalf("redraw %q", out.String())
+	}
+}
+
+func TestHistoryDraftAndApprovalIsolation(t *testing.T) {
+	c := controlledTerminal(t, nil)
+	c.in.Remember("first")
+	c.in.Remember("second")
+	result := make(chan string, 1)
+	go func() { line, _ := c.in.ReadLinePrompt(context.Background(), "scout> ", true); result <- line }()
+	awaitActive(t, c.in)
+	c.send("draft\x1b[A\x1b[A\x1b[B\x1b[B\n")
+	if got := <-result; got != "draft" {
+		t.Fatalf("draft %q", got)
+	}
+	go func() {
+		line, _ := c.in.ReadLinePrompt(context.Background(), "Allow once? [y/N] ", false)
+		result <- line
+	}()
+	awaitActive(t, c.in)
+	c.send("\x1b[Ay\n")
+	if got := <-result; got != "y" {
+		t.Fatalf("approval retrieved history: %q", got)
+	}
+	c.in.ClearHistory()
+	go func() { line, _ := c.in.ReadLinePrompt(context.Background(), "scout> ", true); result <- line }()
+	awaitActive(t, c.in)
+	c.send("\x1b[A\n")
+	if got := <-result; got != "" {
+		t.Fatalf("clear retained history: %q", got)
 	}
 }

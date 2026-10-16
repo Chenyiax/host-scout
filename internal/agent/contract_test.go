@@ -139,7 +139,7 @@ func TestGenericClientTwoTurnsAndToolRoundTrip(t *testing.T) {
 	if executed != 1 || len(c.requests) != 3 {
 		t.Fatal("unexpected execution count")
 	}
-	want := []agent.EventKind{agent.TurnStarted, agent.ToolProposed, agent.ToolStarted, agent.ToolFinished, agent.TextDelta, agent.TurnFinished}
+	want := []agent.EventKind{agent.TurnStarted, agent.ModelRequested, agent.ToolProposed, agent.ToolStarted, agent.ToolFinished, agent.ModelRequested, agent.TextDelta, agent.TurnFinished}
 	if !reflect.DeepEqual(eventKinds(events), want) {
 		t.Fatalf("events %v", eventKinds(events))
 	}
@@ -284,7 +284,7 @@ func TestApprovalAndOrdinaryFailureEvents(t *testing.T) {
 			if s.Evidence()[0].Result.Status != tc.status {
 				t.Fatalf("%+v", s.Evidence())
 			}
-			want := []agent.EventKind{agent.TurnStarted, agent.ToolProposed, agent.ApprovalRequested}
+			want := []agent.EventKind{agent.TurnStarted, agent.ModelRequested, agent.ToolProposed, agent.ApprovalRequested}
 			if tc.err == nil {
 				want = append(want, agent.ApprovalResolved)
 			}
@@ -293,7 +293,7 @@ func TestApprovalAndOrdinaryFailureEvents(t *testing.T) {
 			}
 			want = append(want, agent.ToolFinished)
 			if tc.err == nil {
-				want = append(want, agent.TextDelta)
+				want = append(want, agent.ModelRequested, agent.TextDelta)
 			}
 			want = append(want, agent.TurnFinished)
 			if !reflect.DeepEqual(eventKinds(events), want) {
@@ -329,7 +329,7 @@ func TestUnknownInvalidAndEmptyResponse(t *testing.T) {
 	if err := s.Ask(context.Background(), "empty", agent.Hooks{OnEvent: func(e agent.Event) { events = append(events, e) }}); err == nil {
 		t.Fatal("empty response accepted")
 	}
-	if len(c.requests) != 1 || len(events) != 2 {
+	if len(c.requests) != 1 || len(events) != 3 {
 		t.Fatal("extra request or missing terminal event")
 	}
 }
@@ -646,6 +646,46 @@ func TestBusyClearAndImmutableSnapshots(t *testing.T) {
 	}
 	if len(s.Evidence()) != 0 {
 		t.Fatal("records survived clear")
+	}
+}
+
+func TestEvidenceRetainsBoundedInvocationAfterModelFailure(t *testing.T) {
+	arguments := json.RawMessage(`{"argv":["echo","hello"],"purpose":"check"}`)
+	c := &fakeClient{}
+	c.create = func(context.Context, model.Request, func(string)) (model.Response, error) {
+		if len(c.requests) == 1 {
+			return callsResponse(model.ToolCall{CallID: "cmd-1", Name: "probe", Arguments: arguments}), nil
+		}
+		return model.Response{}, &model.Error{Kind: model.Transport}
+	}
+	s := makeSession(t, c, 0, probeTool{"probe", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		tools.Started(ctx)
+		return tools.Value("observed"), nil
+	}})
+	if err := s.Ask(context.Background(), "inspect", agent.Hooks{}); err == nil {
+		t.Fatal("expected model failure")
+	}
+	records := s.Evidence()
+	if len(records) != 1 || string(records[0].Arguments) != string(arguments) || records[0].ArgumentsTruncated {
+		t.Fatalf("record lost arguments: %+v", records)
+	}
+	records[0].Arguments[0] = 'x'
+	if string(s.Evidence()[0].Arguments) != string(arguments) {
+		t.Fatal("evidence snapshot mutated internal arguments")
+	}
+	if len(s.History()) != 3 || !strings.Contains(s.History()[2].Text, records[0].ID) {
+		t.Fatal("record ID missing from model feedback")
+	}
+
+	limitClient := &fakeClient{create: func(context.Context, model.Request, func(string)) (model.Response, error) {
+		return callsResponse(model.ToolCall{CallID: "cmd-2", Name: "probe", Arguments: arguments}), nil
+	}}
+	limited := makeSession(t, limitClient, 1, probeTool{"probe", func(context.Context, json.RawMessage) (any, error) {
+		t.Fatal("step-limited tool executed")
+		return nil, nil
+	}})
+	if !errors.Is(limited.Ask(context.Background(), "inspect", agent.Hooks{}), agent.ErrStepLimit) || string(limited.Evidence()[0].Arguments) != string(arguments) {
+		t.Fatal("skipped invocation lost arguments")
 	}
 }
 

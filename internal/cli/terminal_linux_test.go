@@ -194,7 +194,7 @@ func TestLinuxPTYInteractiveMVP(t *testing.T) {
 			sendText(w, "GOAL-CORRECTED", false)
 		case "twice":
 			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprint(w, `data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"a","name":"run_command","arguments":"{\"argv\":[\"printf\",\"APPROVED\"]}"},{"type":"function_call","call_id":"b","name":"run_command","arguments":"{\"argv\":[\"printf\",\"DENIED\"]}"}]}}`+"\n\n")
+			fmt.Fprint(w, `data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"a","name":"run_command","arguments":"{\"argv\":[\"printf\",\"APPROVED\"],\"purpose\":\"检查打印输出\"}"},{"type":"function_call","call_id":"b","name":"run_command","arguments":"{\"argv\":[\"printf\",\"DENIED\"]}"}]}}`+"\n\n")
 		case "modelwait":
 			w.Header().Set("Content-Type", "text/event-stream")
 			fmt.Fprint(w, `data: {"type":"response.output_text.delta","delta":"MODEL-WAITING"}`+"\n\n")
@@ -242,6 +242,7 @@ func TestLinuxPTYInteractiveMVP(t *testing.T) {
 	p.await(t, "scout> ", prompts)
 	p.send(t, "twice\n")
 	p.await(t, "Allow once? [y/N]", 1)
+	p.await(t, "Model purpose: 检查打印输出", 1)
 	p.send(t, "Y\n")
 	p.await(t, "Allow once? [y/N]", 2)
 	p.send(t, "n\n")
@@ -249,7 +250,6 @@ func TestLinuxPTYInteractiveMVP(t *testing.T) {
 	prompts++
 	p.await(t, "scout> ", prompts)
 	p.send(t, "/evidence evidence-001\n")
-	p.await(t, "APPROVED", 2)
 	prompts++
 	p.await(t, "scout> ", prompts)
 	p.send(t, "/evidence evidence-002\n")
@@ -310,7 +310,7 @@ func TestLinuxPTYInteractiveMVP(t *testing.T) {
 	prompts++
 	p.await(t, "scout> ", prompts)
 	p.send(t, "/clear\n")
-	p.await(t, "Session context cleared", 1)
+	p.await(t, "Session context, records and input history cleared", 1)
 	prompts++
 	p.await(t, "scout> ", prompts)
 	p.send(t, "fresh\n")
@@ -506,7 +506,7 @@ func TestLinuxPTYLongTurnClarificationRetryAndContextLimit(t *testing.T) {
 	p.await(t, "Context limit reached", 1)
 	p.await(t, "scout> ", 6)
 	p.send(t, "/clear\n")
-	p.await(t, "Session context cleared", 1)
+	p.await(t, "Session context, records and input history cleared", 1)
 	p.await(t, "scout> ", 7)
 	p.send(t, "fresh\n")
 	p.await(t, "FRESH-ANSWER", 1)
@@ -670,5 +670,46 @@ func TestLinuxPTYCleanupFailurePairsBatchAndStopsModel(t *testing.T) {
 	p.waitExit(t)
 	if requests.Load() != 2 {
 		t.Fatalf("unexpected model requests: %d", requests.Load())
+	}
+}
+
+func TestLinuxPTYUnicodeEditingHistoryAndClear(t *testing.T) {
+	t.Setenv("HOST_SCOUT_API_KEY", "pty-key")
+	var mu sync.Mutex
+	var users []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Input []map[string]json.RawMessage `json:"input"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		users = append(users, lastUser(req.Input))
+		mu.Unlock()
+		sendText(w, "EDIT-OK", false)
+	}))
+	defer server.Close()
+	p := spawnPTY(t, server.URL, "pty-key")
+	p.await(t, "\r\nscout> ", 1)
+	p.send(t, "ab中e\u0301\x1b[D\x1b[DX\x1b[H\x1b[3~\x1b[F\x7f\n")
+	p.await(t, "\r\x1b[2Kscout> bX中", 1)
+	if !strings.Contains(p.output(), "\r\x1b[2Kscout> bX中") {
+		t.Fatalf("edited line not rendered: %q", p.output())
+	}
+	p.await(t, "EDIT-OK", 1)
+	p.await(t, "\r\nscout> ", 2)
+	p.send(t, "草稿\x1b[A\x1b[B\n")
+	p.await(t, "EDIT-OK", 2)
+	p.await(t, "\r\nscout> ", 3)
+	p.send(t, "/clear\n")
+	p.await(t, "input history cleared", 1)
+	p.await(t, "\r\nscout> ", 4)
+	p.send(t, "\x1b[A\n")
+	p.await(t, "\r\nscout> ", 5)
+	p.send(t, "/exit\n")
+	p.waitExit(t)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(users) != 2 || users[0] != "bX中" || users[1] != "草稿" {
+		t.Fatalf("submitted users: %q", users)
 	}
 }

@@ -38,6 +38,30 @@ func TestDeniedCommandDoesNotRun(t *testing.T) {
 	}
 }
 
+func TestOptionalPurposeReachesApprovalWithoutChangingAuthorization(t *testing.T) {
+	approver := &testApprover{}
+	tool, err := New(approver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		raw     string
+		purpose string
+	}{
+		{`{"argv":["nonexistent-command-for-test"]}`, ""},
+		{`{"argv":["nonexistent-command-for-test"],"purpose":"检查主机版本"}`, "检查主机版本"},
+	} {
+		result, err := tool.Run(context.Background(), json.RawMessage(tc.raw))
+		if err != nil || result.Status != tools.Denied {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+		got := approver.calls[len(approver.calls)-1]
+		if got.Purpose != tc.purpose || len(got.Argv) != 1 || got.Argv[0] != "nonexistent-command-for-test" {
+			t.Fatalf("approval request=%+v", got)
+		}
+	}
+}
+
 func TestApprovedCommandRuns(t *testing.T) {
 	approver := &testApprover{allow: true}
 	tool, err := New(approver)
@@ -71,6 +95,9 @@ func TestInvalidArgumentsAreRejectedBeforeApproval(t *testing.T) {
 		"null",
 		`{"argv":["echo","` + strings.Repeat("x", maxArgvBytes) + `"]}`,
 		`{"argv":[` + strings.Repeat(`"echo",`, 32) + `"echo"]}`,
+		`{"argv":["echo"],"purpose":"line\nnext"}`,
+		`{"argv":["echo"],"purpose":"\u001b[31m"}`,
+		`{"argv":["echo"],"purpose":"` + strings.Repeat("界", 241) + `"}`,
 	} {
 		if value, err := tool.Run(context.Background(), json.RawMessage(raw)); err != nil || value.Code != "invalid_arguments" {
 			t.Fatalf("accepted invalid arguments %s", raw)

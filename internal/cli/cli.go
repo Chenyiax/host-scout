@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"golang.org/x/term"
 
@@ -55,6 +54,10 @@ func (w displayWriter) Write(p []byte) (int, error) {
 }
 
 func Run(args []string, input io.Reader, output, errorsOut io.Writer) (runErr error) {
+	outputTerminal := false
+	if file, ok := output.(*os.File); ok {
+		outputTerminal = term.IsTerminal(int(file.Fd()))
+	}
 	state := &display{key: os.Getenv("HOST_SCOUT_API_KEY")}
 	defer func() {
 		if runErr != nil {
@@ -100,7 +103,8 @@ func Run(args []string, input io.Reader, output, errorsOut io.Writer) (runErr er
 	if err != nil {
 		return err
 	}
-	state.raw = reader.terminal
+	state.raw = reader.terminal && outputTerminal
+	reader.editing = state.raw
 	defer reader.Close()
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt)
@@ -117,7 +121,8 @@ func Run(args []string, input io.Reader, output, errorsOut io.Writer) (runErr er
 			}
 		}
 	}()
-	commandTool, err := commandtool.New(terminalApprover{input: reader, output: output})
+	presenter := &turnPresenter{out: output}
+	commandTool, err := commandtool.New(terminalApprover{input: reader, output: output, managedPrompt: true})
 	if err != nil {
 		return err
 	}
@@ -135,13 +140,13 @@ func Run(args []string, input io.Reader, output, errorsOut io.Writer) (runErr er
 	for _, definition := range registry.Definitions() {
 		toolNames = append(toolNames, definition.Name)
 	}
-	fmt.Fprintf(output, "Host Scout v1 MVP (Responses API)\nModel: %s  Endpoint: %s\nPlatform: %s/%s  Tools: %s  Max steps: %s\nType /help for commands. Ctrl+C cancels input or the active turn.\n", cfg.Model, cfg.BaseURL, runtime.GOOS, runtime.GOARCH, strings.Join(toolNames, ", "), maxStepsLabel(cfg.MaxSteps))
+	fmt.Fprintf(output, "Host Scout (Responses API)\nModel: %s  Endpoint: %s\nPlatform: %s/%s  Tools: %s  Max steps: %s\nType /help for commands. Enter submits; Ctrl+C cancels input or the active turn.\n", safeText(cfg.Model), safeText(cfg.BaseURL), runtime.GOOS, runtime.GOARCH, strings.Join(toolNames, ", "), maxStepsLabel(cfg.MaxSteps))
 	if runtime.GOOS != "linux" {
 		fmt.Fprintln(output, "Development mode: only the direct command process is cleaned up on this platform. Host commands still require interactive approval.")
 	}
 	for {
 		fmt.Fprint(output, "\nscout> ")
-		line, readErr := reader.ReadLine(context.Background())
+		line, readErr := reader.ReadLinePrompt(context.Background(), "scout> ", true)
 		if errors.Is(readErr, errInterrupted) {
 			continue
 		}
@@ -160,8 +165,12 @@ func Run(args []string, input io.Reader, output, errorsOut io.Writer) (runErr er
 			if done := command(line, session, registry, cfg, output); done {
 				return nil
 			}
+			if line == "/clear" {
+				reader.ClearHistory()
+			}
 			continue
 		}
+		reader.Remember(line)
 		ctx, cancel := context.WithCancel(context.Background())
 		turnMu.Lock()
 		turnCancel = cancel
@@ -169,36 +178,8 @@ func Run(args []string, input io.Reader, output, errorsOut io.Writer) (runErr er
 		if reader.EOF() {
 			cancel()
 		}
-		printed := false
 		err := session.Ask(ctx, line, agent.Hooks{
-			OnEvent: func(event agent.Event) {
-				switch event.Kind {
-				case agent.TextDelta:
-					if !printed {
-						fmt.Fprint(output, "\nassistant> ")
-						printed = true
-					}
-					fmt.Fprint(output, event.Text)
-				case agent.ToolFinished:
-					e := event.Evidence
-					fmt.Fprintf(output, "\n→ %s  %s  call=%s  %s (%s)\n", e.Tool, e.ID, e.CallID, e.Result.Status, e.Result.Code)
-					printed = false
-				case agent.ToolStarted:
-					fmt.Fprintf(output, "\nStarting %s (call=%s)\n", event.Tool, event.CallID)
-					printed = false
-				case agent.ToolProposed:
-					fmt.Fprintf(output, "\nProposed %s (call=%s)\n", event.Tool, event.CallID)
-					printed = false
-				case agent.ApprovalResolved:
-					if !event.Approved {
-						fmt.Fprintln(output, "Command denied. Authorization input is not chat; enter any follow-up after the turn finishes.")
-					}
-				case agent.TurnFinished:
-					if event.Err == nil {
-						fmt.Fprintln(output, "\nTurn completed.")
-					}
-				}
-			},
+			OnEvent: presenter.OnEvent,
 		})
 		turnMu.Lock()
 		turnCancel = nil
@@ -223,19 +204,32 @@ func reportTurnError(err error, records []agent.Evidence, output io.Writer) {
 	if len(message) > 1024 {
 		message = message[:1024] + "…"
 	}
-	fmt.Fprintf(output, "\nTurn stopped: %s\n", message)
+	fmt.Fprintf(output, "\nTurn stopped: %s\n", safeText(message))
 	if errors.Is(err, agent.ErrCleanupFailed) {
 		for i := len(records) - 1; i >= 0; i-- {
 			record := records[i]
 			if record.Result.Code == "cleanup_failed" && record.Result.Status == tools.Failed {
-				fmt.Fprintf(output, "Cleanup failed (original reason: %s). Managed processes may remain. Inspect /evidence %s.\n", record.Result.TerminationReason, record.ID)
+				fmt.Fprintf(output, "Cleanup failed (original reason: %s). Managed processes may remain. Inspect /evidence %s before running another command.\n", safeText(record.Result.TerminationReason), safeText(record.ID))
 				break
 			}
 		}
 	}
 	var modelErr *model.Error
-	if errors.As(err, &modelErr) && modelErr.Kind == model.ContextLimit {
-		fmt.Fprintln(output, "Context limit reached. History is preserved; use /clear and ask again to start fresh.")
+	if errors.As(err, &modelErr) {
+		switch modelErr.Kind {
+		case model.ContextLimit:
+			fmt.Fprintln(output, "Context limit reached. History is preserved; use /clear and ask again to start fresh.")
+		case model.Transport:
+			fmt.Fprintln(output, "Connection failed. Check the endpoint and network, then retry your question; completed commands will not replay automatically.")
+		case model.HTTP:
+			fmt.Fprintln(output, "Model request failed. Check the endpoint, model and service status, then retry your question.")
+		case model.Cancelled:
+			fmt.Fprintln(output, "Cancelled. You can enter a new question.")
+		}
+	} else if errors.Is(err, context.Canceled) {
+		fmt.Fprintln(output, "Cancelled. You can enter a new question.")
+	} else if errors.Is(err, agent.ErrStepLimit) {
+		fmt.Fprintln(output, "Model step limit reached. Review /evidence, then start a new question or change --max-steps.")
 	}
 }
 
@@ -269,7 +263,7 @@ func command(line string, session *agent.Session, registry *tools.Registry, cfg 
 	case "/exit", "/quit":
 		return true
 	case "/help":
-		fmt.Fprintln(output, "/help  /status  /tools  /evidence [id]  /clear  /exit")
+		fmt.Fprintln(output, "/help  /status  /tools  /evidence [id]  /clear  /exit\nAsk a question and press Enter. In a terminal, use Left/Right, Home/End, Backspace/Delete and Up/Down history. Ctrl+C cancels the current input or turn. Each command needs its own y/N approval; check the full argv. Use /evidence <id> for result detail.")
 	case "/status":
 		fmt.Fprintf(output, "State: ready\nAPI: Responses\nModel: %s\nEndpoint: %s\nMax steps per turn: %s\nExecution records: %d\n", cfg.Model, cfg.BaseURL, maxStepsLabel(cfg.MaxSteps), len(session.Evidence()))
 	case "/tools":
@@ -281,33 +275,27 @@ func command(line string, session *agent.Session, registry *tools.Registry, cfg 
 			fmt.Fprintln(output, err)
 			return false
 		}
-		fmt.Fprintln(output, "Session context cleared.")
+		fmt.Fprintln(output, "Session context, records and input history cleared.")
 	case "/evidence":
 		items := session.Evidence()
 		if len(parts) > 1 {
 			for _, item := range items {
 				if item.ID == parts[1] {
-					fmt.Fprintf(output, "%s (%s, call=%s, %s/%s)\nProposed: %s\nStarted: %s\nFinished: %s\n%s\n", item.ID, item.Tool, item.CallID, item.Result.Status, item.Result.Code, item.CreatedAt.Format(time.RFC3339), item.StartedAt.Format(time.RFC3339), item.FinishedAt.Format(time.RFC3339), item.Output)
-					if item.Result.Status == tools.Denied || item.Result.Status == tools.Skipped || item.StartedAt.IsZero() {
-						fmt.Fprintln(output, "No host observation: this request was not executed.")
-					}
-					if item.Result.Code == "cleanup_failed" && item.Result.Status == tools.Failed {
-						fmt.Fprintf(output, "Cleanup failed after %s; managed processes may remain.\n", item.Result.TerminationReason)
-					}
+					printEvidence(output, item)
 					return false
 				}
 			}
-			fmt.Fprintln(output, "Evidence ID not found.")
+			fmt.Fprintln(output, "Evidence ID not found. Use /evidence to list available IDs.")
 			return false
 		}
 		for _, item := range items {
-			fmt.Fprintf(output, "%s  %s  call=%s  %s/%s\n", item.ID, item.Tool, item.CallID, item.Result.Status, item.Result.Code)
+			fmt.Fprintf(output, "%s  %s  call=%s  %s/%s\n", safeText(item.ID), safeText(item.Tool), safeText(item.CallID), item.Result.Status, safeText(item.Result.Code))
 		}
 		if len(items) == 0 {
 			fmt.Fprintln(output, "No execution records yet.")
 		}
 	default:
-		fmt.Fprintln(output, "Unknown command. Type /help.")
+		fmt.Fprintln(output, "Unknown command. Type /help to see local commands.")
 	}
 	return false
 }

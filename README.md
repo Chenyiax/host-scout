@@ -47,11 +47,45 @@ allow_insecure_http = false
 
 Ctrl+C 在就绪时清除未提交输入；在模型请求、重试等待、审批或命令运行时取消当前 Turn。命令会完成有界收尾并记录结果，然后才恢复提示符。运行中的 EOF 也会取消当前工作并退出；若收尾失败，CLI 会提示残留进程风险并以非零状态退出。管道输入中的后续行仍按顺序归属后续提示符。
 
+输入和输出都连接终端时，可用左右方向键、Home/End、Backspace/Delete 编辑当前行；中文、组合字符按可见字符移动。上下方向键浏览最近 100 条普通提问，向下回到尚未提交的草稿；审批答复、本地 `/` 命令和密钥不进入历史，`/clear` 也会清除输入历史。当前轮次运行中，键盘只用于 Ctrl+C 取消，其他输入不会排队成为下一轮提问。输出重定向或管道模式使用逐行纯文本，不依赖光标控制；管道中的命令审批默认拒绝，后续聊天行仍按顺序读取。
+
+界面按事件显示等待模型、工具提议、待审批、执行、终结；“等待模型”不代表已知模型内部进度。命令结果只预览最多 1 KiB/8 行，可用 `/evidence <id>` 回看本进程保留的有界详情。模型文字、用途和工具输出中的终端控制字符会在显示时转义，记录中的原始结果不变。显示文案用于阅读，不是稳定的机器接口。
+
+```text
+scout> 检查 Go 版本
+Waiting for model response (step 1). Ctrl+C cancels; enter a follow-up when this turn ends.
+Proposed run_command (call=call-1); not executed.
+Waiting for approval (call=call-1).
+Model purpose: 检查 Go 版本
+Command requested: "go" "version"
+Its output will be sent to the model.
+Allow once? [y/N] y
+Running run_command (call=call-1). Ctrl+C cancels.
+run_command (call=call-1): succeeded, record evidence-001
+Duration: 12ms
+Output preview:
+go version ...
+Waiting for model response (step 2). Ctrl+C cancels; enter a follow-up when this turn ends.
+assistant> 当前 Go 版本已显示在记录 evidence-001 中。
+Turn completed.
+```
+
+网络故障会提示检查连接后重试；上下文超限会提示先用 `/clear` 开始新上下文；取消后可直接输入新问题。清理失败时先查看对应 `/evidence`，并确认可能残留的进程状态。
+
 历史在接受用户输入、收到完整有效模型响应、每项工具终结三个时点增量提交。部分流式文本不会作为完整回答续传，已执行的工具不会在下一轮自动重跑。明确的 `context_length_exceeded` 会显示上下文超限和 `/clear` 提示；历史与记录仍保留，程序不自动摘要、压缩、截断或缩短输入重试。普通 HTTP 400 与输出长度限制使用各自的错误分类。
 
 ## 唯一内置工具
 
-`run_command` 接受明确的 `argv` 数组，不自动加 shell，也不提升权限。每次合法调用都会展示完整参数，只有当前授权提示下的 `y`（大小写不敏感，忽略两端空白）允许这一次；其他输入拒绝。输出会发送给模型。命令以当前用户权限运行，可能改变主机状态，且没有通用沙箱或敏感信息脱敏保证。
+`run_command` 接受明确的 `argv` 数组和可选的单行 `purpose`（最多 240 个 Unicode 字符），不自动加 shell，也不提升权限。`purpose` 是模型提供的用途说明，不是安全判断；旧的仅含 `argv` 调用仍有效，界面会标记未提供用途。每次合法调用都会展示完整参数，只有当前授权提示下的 `y`（大小写不敏感，忽略两端空白）允许这一次；其他输入拒绝。审批示例：
+
+```text
+Model purpose: 检查 Go 版本
+Command requested: "go" "version"
+Its output will be sent to the model.
+Allow once? [y/N]
+```
+
+用户应核对完整命令。输出会发送给模型；命令以当前用户权限运行，可能改变主机状态，且没有通用沙箱或敏感信息脱敏保证。
 
 每次命令最多执行 10 秒，合并 stdout/stderr 最多保留 32 KiB；超出时标记截断并继续排空。子进程只继承最小环境白名单。Linux 为正式执行平台：一次已启动调用管理自己的进程组，直接进程正常或非零退出后也会终止仍在同组的普通后代；取消或超时时同样清理。收尾总预算最多 2 秒，其中管道等待最多 1 秒。终止失败、直接进程未回收或等待耗尽会返回 `failed/cleanup_failed`，保留原始 `termination_reason`、已取得输出和适用的真实退出码，且不声称残留进程已清理。主动脱离进程组的进程与已发生的副作用不在回滚保证内。Windows/macOS 是开发模式，至少清理直接进程；其进程树清理不视为 Linux 验收结果。
 
@@ -67,6 +101,6 @@ v1 只向基址追加 `/responses` 发起请求，使用 Bearer 认证、`stream
 
 ## 验证与边界
 
-本地测试使用 fake Client/Tool、Responses 模拟服务和 Linux PTY。运行 `go test ./...` 与 `go vet ./...`；Linux 取消与真终端行为需在 Linux 环境实际执行，交叉编译不等同于执行验收。逐场景证据记录在 [`docs/v1-spec-coverage.md`](docs/v1-spec-coverage.md) 和 [`docs/v1-acceptance.md`](docs/v1-acceptance.md)。
+本地测试使用 fake Client/Tool、Responses 模拟服务和 Linux PTY。运行 `go test ./...` 与 `go vet ./...`；Linux 取消与真终端行为需在 Linux 环境实际执行，交叉编译不等同于执行验收。逐场景证据记录在 [`docs/v1-spec-coverage.md`](docs/v1-spec-coverage.md)、[`docs/v1-acceptance.md`](docs/v1-acceptance.md) 和 [`docs/interaction-acceptance.md`](docs/interaction-acceptance.md)。
 
 本期不提供后台命令会话、PTY 工具、stdin 续写、进程池、复杂规划、执行中消息注入、多 Agent、其他远程 API、持久化、报告下载、自动上下文压缩或 token/费用预算。
